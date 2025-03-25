@@ -1,0 +1,143 @@
+---
+- name: Is gaiad running
+  pids:
+      name: gaiad
+  register: pid_gaiad
+  changed_when: false
+
+- name: Set a boolean if gaiad is running
+  ansible.builtin.set_fact:
+    gaiad_running: "{{ pid_gaiad.pids | default([]) | length > 0 }}"
+
+- name: Install Go
+  ansible.builtin.unarchive:
+    src: "https://go.dev/dl/go{{ go_version }}.linux-amd64.tar.gz"
+    dest: /usr/local/
+    remote_src: yes
+    extra_opts: [--strip-components=1]
+    creates: /usr/local/go/bin/go
+
+- name: Check if gaiad binary exists
+  stat:
+    path: /home/{{ ansible_user }}/go/bin/gaiad
+  register: binary_stat
+  changed_when: false
+
+- name: Run command if binary exists
+  command: /home/{{ ansible_user }}/go/bin/gaiad version
+  when: binary_stat.stat.exists
+  register: gaiad_version
+  changed_when: false
+
+- name: Determine if gaiad needs to be built
+  ansible.builtin.set_fact:
+    build_gaiad: >-
+      {{ not binary_stat.stat.exists or
+         (gaiad_version.stdout is defined and gaiad_version.stdout != cosmos_version) }}
+
+- name: Clone Cosmos Gaia repo
+  become: True
+  become_user: "{{ ansible_user }}"
+  ansible.builtin.git:
+    repo: "https://github.com/cosmos/gaia.git"
+    dest: "/home/{{ ansible_user }}/gaia"
+    version: "tags/{{ cosmos_version }}"
+    #  update: no
+  when: build_gaiad
+  register: cosmos_checkout
+  changed_when: cosmos_checkout.after != cosmos_checkout.before  # Forces a change when the version updates
+
+
+- name: Build cosmos
+  become: True
+  become_user: "{{ ansible_user }}"
+  command: make install
+  args:
+    chdir: /home/{{ ansible_user }}/gaia
+    #  creates: /home/{{ ansible_user }}/go/bin/gaiad
+  environment:
+    PATH: "/usr/local/go/bin:{{ ansible_env.PATH }}"
+  when: build_gaiad
+
+- name: Check if configs already generated
+  stat:
+    path: /home/{{ ansible_user }}/.gaia/config/config.toml
+  register: stat_result
+
+- name: Init / setup configs for cosmos
+  become: True
+  become_user: "{{ ansible_user }}"
+  command: /home/{{ ansible_user }}/go/bin/gaiad init {{ cosmos_node_name }} --chain-id {{ cosmos_chain_id }}
+  args:
+    creates:
+      - /home/{{ ansible_user }}/.gaia/config/config.toml
+      - /home/{{ ansible_user }}/.gaia/config/app.toml
+      - /home/{{ ansible_user }}/.gaia/config/genesis.json
+      - /home/{{ ansible_user }}/.gaia/config/client.toml
+  environment:
+    PATH: "/home/{{ ansible_user }}/go/bin:/usr/local/go/bin:{{ ansible_env.PATH }}"
+  when: not stat_result.stat.exists
+
+- name: Update app.toml minimum-gas-prices
+  ansible.builtin.replace:
+    path: /home/{{ ansible_user }}/.gaia/config/app.toml
+    regexp: '^minimum-gas-prices = ""'
+    replace: 'minimum-gas-prices = "0.025uatom"'
+
+- name: Get block height if not already set
+  shell: curl -s {{ block_service }}/block | jq -r .result.block.header.height
+  register: block_height
+  when: gaia_running is false
+
+- name: Get block hash if not already set
+  shell: curl -s {{ block_service }}/block?height={{ (block_height.stdout | int) - block_offset }} | jq -r .result.block_id.hash
+  register: block_hash
+  when: gaia_running is false
+
+- name: update config.toml files for trust height and hash
+  become: True
+  become_user: "{{ ansible_user }}"
+  ansible.builtin.replace:
+    path: /home/{{ ansible_user }}/.gaia/config/config.toml
+    regexp: '^{{ item.key }} =.*'
+    replace: '{{ item.key }} = {{ item.value }}'
+  with_items:
+    - { key: 'trust_height', value: "{{ block_height.stdout|int - block_offset }}" }
+    - { key: 'trust_hash', value: '"{{ block_hash.stdout }}"' }
+    - { key: 'rpc_servers', value:  "\"{{ rpc_servers}}\"" }
+  when: gaia_running is false
+
+
+- name: snag address book
+  become: True
+  become_user: "{{ ansible_user }}"
+  get_url:
+    url: "https://blockhunters.dev/snapshots/cosmos/addrbook.json"
+    dest: /home/{{ ansible_user }}/.gaia/config/addrbook.json
+
+- name: uncompress backlog
+  become: True
+  become_user: "{{ ansible_user }}"
+  ansible.builtin.unarchive:
+    src: /tmp/ansible/latest.tar.zst
+    dest: /home/{{ ansible_user }}/.gaia/
+    creates: /home/{{ ansible_user }}/.gaia/data/evidence.db
+
+- name: Creates directory
+  become: True
+  become_user: "{{ ansible_user }}"
+  ansible.builtin.file:
+    path: /home/{{ ansible_user }}/.config/systemd/user
+    state: directory
+
+- name: Copy gaiad.service
+  copy:
+    src: /tmp/ansible/gaiad.service
+    dest: /etc/systemd/system/gaiad.service
+    mode: '0644'
+
+- name: enable systemd service
+  ansible.builtin.systemd:
+    enabled: true
+    masked: no
+    name: gaiad

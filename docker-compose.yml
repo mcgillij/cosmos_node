@@ -1,0 +1,24 @@
+version: "3.3"
+services:
+  cosmos:
+    cgroup: host
+    entrypoint: /sbin/init
+    image: cosmosdeploy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    tmpfs:
+      - /tmp
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - /var/run/dbus:/var/run/dbus
+      - ./:/tmp/ansible
+    privileged: true  # Required for systemd to run properly
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+      - audit_control
+      - audit_write
